@@ -1,4 +1,4 @@
-name: DADAVAI 24H BOT TEST
+name: DADAVAI 24H BOT V5
 
 on:
   workflow_dispatch:
@@ -20,17 +20,16 @@ jobs:
       - name: Install requirements
         run: pip install -r requirements.txt
 
-      - name: Check Bot File
+      - name: Verify V5 Code
         run: |
-          echo "WORKFLOW CHECK STARTED"
-          pwd
-          ls -l bot.py
-          grep -n "DADAVAI NEW BOT VERSION 2 STARTED" bot.py || true
+          echo "CHECKING BOT VERSION"
+          grep -n "DADAVAI V5 BOT READY" bot.py
+          python -m py_compile bot.py
 
       - name: Start Telegram Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
         run: |
-          echo "BOT START STEP"
+          echo "STARTING DADAVAI V5"
           timeout 240s python -u bot.py || test $? -eq 124
