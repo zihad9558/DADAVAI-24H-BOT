@@ -20,13 +20,17 @@ jobs:
       - name: Install requirements
         run: pip install -r requirements.txt
 
+      - name: Check Bot File
+        run: |
+          echo "WORKFLOW CHECK STARTED"
+          pwd
+          ls -l bot.py
+          grep -n "DADAVAI NEW BOT VERSION 2 STARTED" bot.py || true
+
       - name: Start Telegram Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
         run: |
-  echo "WORKFLOW CHECK STARTED"
-  pwd
-  ls -l bot.py
-  grep -n "DADAVAI NEW BOT VERSION 2 STARTED" bot.py || true
-  timeout 240s python -u bot.py || test $? -eq 124
+          echo "BOT START STEP"
+          timeout 240s python -u bot.py || test $? -eq 124
