@@ -23,4 +23,4 @@ jobs:
       - name: Start Telegram Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-        run: timeout 240s python bot.py || test $? -eq 124
+        run: timeout 240s python -u bot.py || test $? -eq 124
