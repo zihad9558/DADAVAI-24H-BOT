@@ -205,6 +205,17 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 
+async def otc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = check_otc_source()
+
+    await update.message.reply_text(
+        "💎 DADAVAI OTC DATA CHECK\n\n"
+        f"📊 Pair: {result['pair']}\n"
+        f"🔌 Provider: {result['provider']}\n"
+        f"📡 Status: {result['status']}\n"
+        f"⚠️ Reason: {result['reason']}\n\n"
+        "No unverified OTC signals."
+    )
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 DADAVAI 24H BOT HELP\n\n"
@@ -274,6 +285,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signal", signal))
     app.add_handler(CommandHandler("help", help_command))
+app.add_handler(CommandHandler("otc", otc_command))
 
     print("DADAVAI 24H BOT started!")
 
