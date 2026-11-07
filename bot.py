@@ -3,6 +3,16 @@ import json
 import asyncio
 import urllib.parse
 import urllib.request
+# OTC DATA SOURCE CHECKER
+OTC_PAIRS = ["USD/BRL-OTC"]
+
+def check_otc_source():
+    return {
+        "pair": "USD/BRL-OTC",
+        "provider": "Twelve Data",
+        "status": "UNAVAILABLE",
+        "reason": "Twelve Data does not provide verified Quotex OTC prices."
+    }
 
 from telegram import Update
 from telegram.ext import (
