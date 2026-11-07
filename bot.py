@@ -3,16 +3,9 @@ import json
 import asyncio
 import urllib.parse
 import urllib.request
-# OTC DATA SOURCE CHECKER
-OTC_PAIRS = ["USD/BRL-OTC"]
 
-def check_otc_source():
-    return {
-        "pair": "USD/BRL-OTC",
-        "provider": "Twelve Data",
-        "status": "UNAVAILABLE",
-        "reason": "Twelve Data does not provide verified Quotex OTC prices."
-    }
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from telegram import Update
 from telegram.ext import (
@@ -24,9 +17,17 @@ from telegram.ext import (
 TOKEN = os.getenv("BOT_TOKEN")
 API_KEY = os.getenv("TWELVE_DATA_KEY")
 
+DHAKA = ZoneInfo("Asia/Dhaka")
+
+# Normal Forex pairs only
 PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY"]
+
+# Quotex OTC is not available from Twelve Data
+OTC_PAIRS = ["USD/BRL-OTC"]
+
 CHATS = set()
 LAST_SIGNAL = {}
+SIGNAL_COUNTS = {}
 
 
 def fetch_market_data(symbol):
@@ -34,6 +35,7 @@ def fetch_market_data(symbol):
         "symbol": symbol,
         "interval": "1min",
         "outputsize": 100,
+        "timezone": "Asia/Dhaka",
         "apikey": API_KEY
     })
 
@@ -44,29 +46,33 @@ def fetch_market_data(symbol):
 
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "DadavaiBot/1.0"}
+        headers={"User-Agent": "DadavaiBot/2.0"}
     )
 
     with urllib.request.urlopen(
         request, timeout=20
     ) as response:
-        data = json.loads(response.read().decode())
+        data = json.loads(
+            response.read().decode()
+        )
 
     if "values" not in data:
         raise ValueError(
             data.get("message", "Market data unavailable")
         )
 
-    # Twelve Data returns newest candle first.
     rows = list(reversed(data["values"]))
 
-    # Ignore the newest candle because it may be incomplete.
+    # Ignore possibly incomplete latest candle
     rows = rows[:-1]
 
     if len(rows) < 60:
         raise ValueError("Not enough candle data")
 
-    closes = [float(row["close"]) for row in rows]
+    closes = [
+        float(row["close"])
+        for row in rows
+    ]
 
     return rows[-1]["datetime"], closes
 
@@ -80,8 +86,8 @@ def ema(values, period):
 
     for value in values[1:]:
         result.append(
-            (value * multiplier)
-            + (result[-1] * (1 - multiplier))
+            value * multiplier
+            + result[-1] * (1 - multiplier)
         )
 
     return result
@@ -93,8 +99,8 @@ def calculate_rsi(values, period=14):
         for i in range(len(values) - period, len(values))
     ]
 
-    gains = [max(change, 0) for change in changes]
-    losses = [max(-change, 0) for change in changes]
+    gains = [max(x, 0) for x in changes]
+    losses = [max(-x, 0) for x in changes]
 
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
@@ -110,6 +116,7 @@ def calculate_rsi(values, period=14):
 def analyze_market(closes):
     ema9 = ema(closes, 9)[-1]
     ema21 = ema(closes, 21)[-1]
+    ema50 = ema(closes, 50)[-1]
 
     rsi = calculate_rsi(closes)
 
@@ -125,14 +132,14 @@ def analyze_market(closes):
     macd = macd_line[-1]
 
     if (
-        ema9 > ema21
+        ema9 > ema21 > ema50
         and macd > macd_signal
         and 50 < rsi < 70
     ):
         return "BUY", rsi
 
     if (
-        ema9 < ema21
+        ema9 < ema21 < ema50
         and macd < macd_signal
         and 30 < rsi < 50
     ):
@@ -152,80 +159,81 @@ async def get_signal(symbol):
 
 
 def signal_message(symbol, candle_time, direction, rsi):
-    emoji = {
-        "BUY": "🟢",
-        "SELL": "🔴",
-        "WAIT": "⚪"
-    }.get(direction, "⚪")
+    emoji = "🟢" if direction == "BUY" else "🔴"
 
     return (
-        "🤖 DADAVAI 24H BOT\n\n"
-        f"💱 Pair: {symbol}\n"
-        "⏱ Timeframe: M1\n"
-        f"📊 Signal: {emoji} {direction}\n"
-        f"📈 RSI: {rsi:.2f}\n"
-        f"🕒 Candle: {candle_time}\n\n"
-        "⚠️ Signals are not guaranteed. "
-        "Verify before trading."
+        "💎 DADAVAI 24H BOT\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📊 PAIR: {symbol}\n"
+        "⏱ TIMEFRAME: M1\n"
+        f"📈 SIGNAL: {emoji} {direction}\n"
+        f"📊 RSI: {rsi:.2f}\n"
+        f"🕒 CANDLE: {candle_time} (UTC+6)\n"
+        "━━━━━━━━━━━━━━\n"
+        "⚠️ Signals are not guaranteed."
     )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    CHATS.add(chat_id)
+    CHATS.add(update.effective_chat.id)
 
     await update.message.reply_text(
         "🤖 DADAVAI 24H BOT\n\n"
-        "Welcome!\n"
-        "Forex M1 Signal Engine is active.\n\n"
-        "/signal - Check market signals\n"
+        "Signal Engine is active.\n\n"
+        "/signal - Live Forex signals\n"
+        "/otc - OTC data status\n"
         "/help - Help"
     )
 
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📊 Checking live Forex market data..."
+        "📊 Checking Forex market data..."
     )
 
     for symbol in PAIRS:
         try:
             candle_time, direction, rsi = await get_signal(symbol)
 
-            message = signal_message(
-                symbol, candle_time, direction, rsi
+            await update.message.reply_text(
+                signal_message(
+                    symbol, candle_time, direction, rsi
+                )
             )
-
-            await update.message.reply_text(message)
 
         except Exception as error:
             await update.message.reply_text(
                 f"⚠️ {symbol}: Data unavailable.\n"
-                f"Reason: {str(error)[:180]}"
+                f"{str(error)[:150]}"
             )
 
 
 async def otc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = check_otc_source()
-
     await update.message.reply_text(
-        "💎 DADAVAI OTC DATA CHECK\n\n"
-        f"📊 Pair: {result['pair']}\n"
-        f"🔌 Provider: {result['provider']}\n"
-        f"📡 Status: {result['status']}\n"
-        f"⚠️ Reason: {result['reason']}\n\n"
-        "No unverified OTC signals."
+        "💎 DADAVAI OTC DATA CHECK\n"
+        "━━━━━━━━━━━━━━\n"
+        "📊 PAIR: USD/BRL-OTC\n"
+        "🔌 PROVIDER: Twelve Data\n"
+        "📡 STATUS: UNAVAILABLE\n\n"
+        "Twelve Data does not provide "
+        "verified Quotex OTC prices.\n\n"
+        "⚠️ No unverified OTC signals will be sent."
     )
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 DADAVAI 24H BOT HELP\n\n"
         "/start - Start bot\n"
-        "/signal - Get M1 Forex signals\n"
+        "/signal - Forex signals\n"
+        "/otc - OTC data status\n"
         "/help - Help\n\n"
-        "Pairs:\n"
+        "Forex pairs:\n"
         "EUR/USD\n"
         "GBP/USD\n"
-        "USD/JPY"
+        "USD/JPY\n\n"
+        "OTC pair:\n"
+        "USD/BRL-OTC (data unavailable)"
     )
 
 
@@ -238,11 +246,21 @@ async def automatic_scan(app):
                 if direction == "WAIT":
                     continue
 
-                # Send only once for each completed candle.
                 if LAST_SIGNAL.get(symbol) == candle_time:
                     continue
 
+                count = SIGNAL_COUNTS.get(candle_time, 0)
+
+                if count >= 2:
+                    continue
+
                 LAST_SIGNAL[symbol] = candle_time
+                SIGNAL_COUNTS[candle_time] = count + 1
+
+                # Keep recent candle counts only
+                if len(SIGNAL_COUNTS) > 10:
+                    oldest = next(iter(SIGNAL_COUNTS))
+                    del SIGNAL_COUNTS[oldest]
 
                 message = signal_message(
                     symbol, candle_time, direction, rsi
@@ -268,7 +286,8 @@ async def post_init(app):
 
 
 def main():
-    print("DADAVAI NEW BOT VERSION 2 STARTED", flush=True)
+    print("DADAVAI NEW BOT VERSION 3 STARTED", flush=True)
+
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is missing")
 
@@ -284,10 +303,10 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signal", signal))
+    app.add_handler(CommandHandler("otc", otc_command))
     app.add_handler(CommandHandler("help", help_command))
-app.add_handler(CommandHandler("otc", otc_command))
 
-    print("DADAVAI 24H BOT started!")
+    print("DADAVAI 24H BOT started!", flush=True)
 
     app.run_polling()
 
