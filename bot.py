@@ -1,8 +1,9 @@
 import os
+import json
 import asyncio
+import logging
 import urllib.parse
 import urllib.request
-import json
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -14,30 +15,42 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# =========================
-# CONFIGURATION
-# =========================
+# =====================================
+# CONFIG
+# =====================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_KEY = os.getenv("TWELVE_DATA_KEY")
 
 TZ = ZoneInfo("Asia/Dhaka")
 
-PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY"]
+PAIRS = [
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+]
 
 CHATS = set()
 PENDING = []
 RESULTS = []
 
 LAST_SIGNAL = {}
-SENT_PER_MINUTE = {}
+LAST_SCAN_SLOT = None
+SCANNER_TASK = None
 
 MAX_SIGNALS_PER_MINUTE = 2
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
-# =========================
+log = logging.getLogger(__name__)
+
+
+# =====================================
 # MARKET DATA
-# =========================
+# =====================================
 
 def fetch_market_data(symbol):
 
@@ -56,50 +69,62 @@ def fetch_market_data(symbol):
 
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0"}
+        headers={"User-Agent": "DADAVAI-V5.1"}
     )
 
     with urllib.request.urlopen(
-        request, timeout=15
+        request, timeout=20
     ) as response:
 
-        data = json.loads(response.read())
+        data = json.loads(
+            response.read().decode()
+        )
 
     if "values" not in data:
+
         raise ValueError(
-            data.get("message", "Market data unavailable")
+            data.get(
+                "message",
+                "Market data unavailable"
+            )
         )
 
     candles = []
 
     for item in data["values"]:
 
+        candle_time = datetime.strptime(
+            item["datetime"],
+            "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=TZ)
+
         candles.append({
-            "dt": datetime.strptime(
-                item["datetime"],
-                "%Y-%m-%d %H:%M:%S"
-            ),
+            "dt": candle_time,
             "open": float(item["open"]),
             "high": float(item["high"]),
             "low": float(item["low"]),
             "close": float(item["close"])
         })
 
-    candles.sort(key=lambda x: x["dt"])
+    candles.sort(
+        key=lambda candle: candle["dt"]
+    )
 
     return candles
 
 
-# =========================
+# =====================================
 # INDICATORS
-# =========================
+# =====================================
 
 def ema(values, period):
 
     if len(values) < period:
         return None
 
-    result = sum(values[:period]) / period
+    result = sum(
+        values[:period]
+    ) / period
 
     multiplier = 2 / (period + 1)
 
@@ -123,21 +148,23 @@ def calculate_rsi(values, period=14):
         for i in range(1, len(values))
     ]
 
+    recent = changes[-period:]
+
     gains = [
         max(change, 0)
-        for change in changes[-period:]
+        for change in recent
     ]
 
     losses = [
         max(-change, 0)
-        for change in changes[-period:]
+        for change in recent
     ]
 
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
 
     if avg_loss == 0:
-        return 100
+        return 100.0
 
     rs = avg_gain / avg_loss
 
@@ -162,30 +189,45 @@ def calculate_macd_histogram(values):
 
         macd_values.append(macd_line)
 
-    signal = ema(macd_values, 9)
+    signal_line = ema(macd_values, 9)
 
-    return macd_values[-1] - signal
+    if signal_line is None:
+        return None
+
+    return macd_values[-1] - signal_line
 
 
-# =========================
+# =====================================
 # SIGNAL ENGINE
-# =========================
+# =====================================
 
 def analyze(candles):
 
     if len(candles) < 60:
         return None
 
-    closes = [c["close"] for c in candles]
+    closes = [
+        candle["close"]
+        for candle in candles
+    ]
 
     fast = ema(closes, 9)
     medium = ema(closes, 21)
     slow = ema(closes, 50)
 
     rsi = calculate_rsi(closes)
-    macd = calculate_macd_histogram(closes)
 
-    if None in (fast, medium, slow, rsi, macd):
+    macd = calculate_macd_histogram(
+        closes
+    )
+
+    if None in (
+        fast,
+        medium,
+        slow,
+        rsi,
+        macd
+    ):
         return None
 
     last = candles[-1]
@@ -195,42 +237,55 @@ def analyze(candles):
     sell = 0
 
     # 1. EMA 9 / 21
+
     if fast > medium:
         buy += 1
+
     elif fast < medium:
         sell += 1
 
     # 2. EMA 21 / 50
+
     if medium > slow:
         buy += 1
+
     elif medium < slow:
         sell += 1
 
     # 3. RSI
+
     if 50 < rsi < 70:
         buy += 1
+
     elif 30 < rsi < 50:
         sell += 1
 
     # 4. MACD
+
     if macd > 0:
         buy += 1
+
     elif macd < 0:
         sell += 1
 
     # 5. Price vs EMA 9
+
     if last["close"] > fast:
         buy += 1
+
     elif last["close"] < fast:
         sell += 1
 
     # 6. Candle direction
+
     if last["close"] > last["open"]:
         buy += 1
+
     elif last["close"] < last["open"]:
         sell += 1
 
     # 7. Price structure
+
     if (
         last["high"] > previous["high"]
         and last["low"] > previous["low"]
@@ -264,49 +319,30 @@ def analyze(candles):
     return None
 
 
-# =========================
-# TELEGRAM MESSAGES
-# =========================
+# =====================================
+# SIGNAL MESSAGE
+# =====================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    chat_id = update.effective_chat.id
-
-    CHATS.add(chat_id)
-
-    await update.message.reply_text(
-        "💎 DADAVAI 24H BOT V5\n\n"
-        "✅ Live Forex Signal Engine\n"
-        "✅ M1 BUY / SELL\n"
-        "✅ Automatic WIN / LOSS tracking\n\n"
-        "Commands:\n"
-        "/signal - Current signal\n"
-        "/stats - Results\n"
-        "/help - Help"
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "💎 DADAVAI BOT HELP\n\n"
-        "/start - Activate bot\n"
-        "/signal - Check signals\n"
-        "/stats - WIN/LOSS statistics\n"
-        "/help - Help"
-    )
-
-
-async def send_signal(app, symbol, signal, entry):
+def make_signal_message(
+    symbol,
+    signal,
+    entry
+):
 
     direction = signal["direction"]
 
-    message = (
-        "💎 DADAVAI 24H BOT V5\n"
+    emoji = (
+        "🟢"
+        if direction == "BUY"
+        else "🔴"
+    )
+
+    return (
+        "💎 DADAVAI 24H BOT 💎\n"
         "━━━━━━━━━━━━━━\n"
         f"📊 PAIR: {symbol}\n"
         "⏱ TIMEFRAME: M1\n"
-        f"📈 SIGNAL: {'🟢' if direction == 'BUY' else '🔴'} {direction}\n"
+        f"📈 SIGNAL: {emoji} {direction}\n"
         f"🎯 CONFLUENCE: {signal['score']}/7\n"
         f"📊 RSI: {signal['rsi']:.2f}\n"
         f"📉 MACD HIST: {signal['macd']:.6f}\n"
@@ -315,26 +351,45 @@ async def send_signal(app, symbol, signal, entry):
         "⏳ EXPIRY: 1 MINUTE\n"
         "━━━━━━━━━━━━━━\n"
         "📌 Result will be checked automatically.\n"
-        "⚠️ Confluence is not a guaranteed win probability."
+        "⚠️ Confluence is not a win probability.\n"
+        "Signals are not guaranteed."
     )
 
-    for chat_id in list(CHATS):
+
+async def broadcast(app, message, recipients=None):
+
+    targets = (
+        list(recipients)
+        if recipients is not None
+        else list(CHATS)
+    )
+
+    for chat_id in targets:
 
         try:
+
             await app.bot.send_message(
                 chat_id=chat_id,
                 text=message
             )
 
         except Exception as error:
-            print("Telegram send error:", error)
+
+            log.warning(
+                "Telegram send error: %s",
+                error
+            )
 
 
-# =========================
+# =====================================
 # RESULT TRACKER
-# =========================
+# =====================================
 
-async def check_results(app, candles, symbol):
+async def evaluate_results(
+    app,
+    symbol,
+    completed
+):
 
     global PENDING
 
@@ -343,41 +398,46 @@ async def check_results(app, candles, symbol):
     for item in PENDING:
 
         if item["symbol"] != symbol:
+
             remaining.append(item)
             continue
 
-        completed = next(
+        target = next(
             (
-                c for c in candles[:-1]
-                if c["dt"] == item["entry_dt"]
+                candle
+                for candle in completed
+                if candle["dt"] == item["entry_dt"]
             ),
             None
         )
 
-        if completed is None:
+        if target is None:
+
             remaining.append(item)
             continue
 
-        entry_price = item["entry_price"]
-        exit_price = completed["close"]
+        entry = item["entry_price"]
+        exit_price = target["close"]
 
-        if item["direction"] == "BUY":
+        if exit_price == entry:
 
-            if exit_price > entry_price:
-                result = "WIN"
-            elif exit_price < entry_price:
-                result = "LOSS"
-            else:
-                result = "NEUTRAL"
+            result = "NEUTRAL"
+
+        elif item["direction"] == "BUY":
+
+            result = (
+                "WIN"
+                if exit_price > entry
+                else "LOSS"
+            )
 
         else:
 
-            if exit_price < entry_price:
-                result = "WIN"
-            elif exit_price > entry_price:
-                result = "LOSS"
-            else:
-                result = "NEUTRAL"
+            result = (
+                "WIN"
+                if exit_price < entry
+                else "LOSS"
+            )
 
         RESULTS.append(result)
 
@@ -389,15 +449,16 @@ async def check_results(app, candles, symbol):
 
         accuracy = (
             wins / total * 100
-            if total else 0
+            if total
+            else 0
         )
 
         message = (
-            "💎 DADAVAI RESULT\n"
+            "💎 DADAVAI RESULT 💎\n"
             "━━━━━━━━━━━━━━\n"
             f"📊 PAIR: {symbol}\n"
             f"📈 SIGNAL: {item['direction']}\n"
-            f"💰 ENTRY: {entry_price}\n"
+            f"💰 ENTRY: {entry}\n"
             f"💰 EXIT: {exit_price}\n"
             f"🏆 RESULT: {result}\n"
             "━━━━━━━━━━━━━━\n"
@@ -409,29 +470,35 @@ async def check_results(app, candles, symbol):
             "Price-based result, not broker settlement."
         )
 
-        for chat_id in list(CHATS):
-
-            try:
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    text=message
-                )
-
-            except Exception as error:
-                print("Result send error:", error)
+        await broadcast(
+            app,
+            message,
+            item["chats"]
+        )
 
     PENDING = remaining
 
 
-# =========================
-# MANUAL SIGNAL
-# =========================
+# =====================================
+# AUTOMATIC SCANNER
+# =====================================
 
-async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def scan_once(app):
 
-    await update.message.reply_text(
-        "🔍 Checking live Forex data..."
+    global LAST_SCAN_SLOT
+
+    now = datetime.now(TZ)
+
+    slot = now.strftime(
+        "%Y-%m-%d %H:%M"
     )
+
+    if LAST_SCAN_SLOT == slot:
+        return
+
+    LAST_SCAN_SLOT = slot
+
+    candidates = []
 
     for symbol in PAIRS:
 
@@ -442,37 +509,279 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 symbol
             )
 
-            completed = candles[:-1]
+            # Fully closed candles only
+
+            completed = [
+                candle
+                for candle in candles
+                if candle["dt"] + timedelta(minutes=1) <= now
+            ]
+
+            # Check previous signals
+
+            await evaluate_results(
+                app,
+                symbol,
+                completed
+            )
+
+            if len(completed) < 60:
+                continue
+
+            signal = analyze(completed)
+
+            if signal is None:
+                continue
+
+            last_closed = completed[-1]
+
+            signal_key = (
+                symbol,
+                last_closed["dt"]
+            )
+
+            if LAST_SIGNAL.get(symbol) == signal_key:
+                continue
+
+            # Entry is the next M1 candle
+
+            entry_time = (
+                last_closed["dt"]
+                + timedelta(minutes=1)
+            )
+
+            entry = next(
+                (
+                    candle
+                    for candle in candles
+                    if candle["dt"] == entry_time
+                ),
+                None
+            )
+
+            if entry is None:
+                continue
+
+            # Avoid sending a stale entry
+
+            entry_age = (
+                now - entry["dt"]
+            ).total_seconds()
+
+            if entry_age < 0 or entry_age > 45:
+                continue
+
+            candidates.append({
+                "symbol": symbol,
+                "signal": signal,
+                "entry": entry,
+                "signal_key": signal_key
+            })
+
+        except Exception as error:
+
+            log.warning(
+                "Market error %s: %s",
+                symbol,
+                error
+            )
+
+    candidates.sort(
+        key=lambda item: item["signal"]["score"],
+        reverse=True
+    )
+
+    selected = candidates[
+        :MAX_SIGNALS_PER_MINUTE
+    ]
+
+    for item in selected:
+
+        symbol = item["symbol"]
+        signal = item["signal"]
+        entry = item["entry"]
+
+        LAST_SIGNAL[symbol] = item["signal_key"]
+
+        PENDING.append({
+            "symbol": symbol,
+            "direction": signal["direction"],
+            "entry_price": entry["open"],
+            "entry_dt": entry["dt"],
+            "chats": list(CHATS)
+        })
+
+        message = make_signal_message(
+            symbol,
+            signal,
+            entry
+        )
+
+        await broadcast(app, message)
+
+        log.info(
+            "SIGNAL SENT: %s %s",
+            symbol,
+            signal["direction"]
+        )
+
+
+async def automatic_scan(app):
+
+    log.info(
+        "DADAVAI V5.1 SCANNER STARTED"
+    )
+
+    while True:
+
+        now = datetime.now(TZ)
+
+        seconds_to_next_minute = (
+            60 - now.second + 2
+        )
+
+        await asyncio.sleep(
+            seconds_to_next_minute
+        )
+
+        try:
+
+            await scan_once(app)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception:
+
+            log.exception(
+                "Automatic scanner error"
+            )
+
+            await asyncio.sleep(5)
+
+
+# =====================================
+# TELEGRAM COMMANDS
+# =====================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_id = update.effective_chat.id
+
+    CHATS.add(chat_id)
+
+    await update.message.reply_text(
+        "💎 DADAVAI 24H BOT V5.1\n\n"
+        "✅ Live Forex M1 Engine\n"
+        "✅ Automatic BUY / SELL\n"
+        "✅ Automatic WIN / LOSS\n"
+        "✅ Maximum 2 signals per minute\n\n"
+        "Commands:\n"
+        "/signal - Check signal\n"
+        "/stats - Performance\n"
+        "/help - Help"
+    )
+
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await update.message.reply_text(
+        "💎 DADAVAI BOT HELP\n\n"
+        "/start - Activate bot\n"
+        "/signal - Check current market\n"
+        "/stats - WIN/LOSS statistics\n"
+        "/help - Help"
+    )
+
+
+async def signal_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await update.message.reply_text(
+        "🔍 Checking live Forex data..."
+    )
+
+    found = []
+
+    for symbol in PAIRS:
+
+        try:
+
+            candles = await asyncio.to_thread(
+                fetch_market_data,
+                symbol
+            )
+
+            now = datetime.now(TZ)
+
+            completed = [
+                candle
+                for candle in candles
+                if candle["dt"] + timedelta(minutes=1) <= now
+            ]
 
             signal = analyze(completed)
 
             if signal:
 
-                entry = candles[-1]
-
-                await send_signal(
-                    context.application,
-                    symbol,
-                    signal,
-                    entry
+                found.append(
+                    (signal["score"], symbol, signal)
                 )
 
-                return
-
         except Exception as error:
-            print(symbol, error)
 
-    await update.message.reply_text(
-        "⏳ No verified signal right now.\n"
-        "Please wait for the next setup."
+            log.warning(
+                "Manual scan error %s: %s",
+                symbol,
+                error
+            )
+
+    found.sort(
+        key=lambda item: item[0],
+        reverse=True
     )
 
+    if not found:
 
-# =========================
-# STATISTICS
-# =========================
+        await update.message.reply_text(
+            "⏳ No qualified signal right now.\n"
+            "Please wait for the next setup."
+        )
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        return
+
+    for _, symbol, signal in found[:2]:
+
+        message = (
+            "💎 DADAVAI MARKET CHECK\n"
+            "━━━━━━━━━━━━━━\n"
+            f"📊 PAIR: {symbol}\n"
+            "⏱ TIMEFRAME: M1\n"
+            f"📈 SIGNAL: {signal['direction']}\n"
+            f"🎯 CONFLUENCE: {signal['score']}/7\n"
+            f"📊 RSI: {signal['rsi']:.2f}\n"
+            "━━━━━━━━━━━━━━\n"
+            "⚠️ Manual check only. "
+            "No automatic result tracking for this check."
+        )
+
+        await update.message.reply_text(
+            message
+        )
+
+
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     wins = RESULTS.count("WIN")
     losses = RESULTS.count("LOSS")
@@ -482,7 +791,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     accuracy = (
         wins / total * 100
-        if total else 0
+        if total
+        else 0
     )
 
     await update.message.reply_text(
@@ -494,107 +804,45 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 TOTAL: {len(RESULTS)}\n"
         f"🎯 ACCURACY: {accuracy:.2f}%\n"
         "━━━━━━━━━━━━━━\n"
-        "Statistics reset when the bot restarts."
+        "Statistics reset when bot restarts."
     )
 
 
-# =========================
-# AUTOMATIC SCANNER
-# =========================
-
-async def automatic_scan(app):
-
-    while True:
-
-        now = datetime.now(TZ)
-
-        delay = 60 - now.second + 2
-
-        await asyncio.sleep(delay)
-
-        minute_key = datetime.now(TZ).strftime(
-            "%Y-%m-%d %H:%M"
-        )
-
-        SENT_PER_MINUTE[minute_key] = 0
-
-        for symbol in PAIRS:
-
-            try:
-
-                candles = await asyncio.to_thread(
-                    fetch_market_data,
-                    symbol
-                )
-
-                if len(candles) < 60:
-                    continue
-
-                # First evaluate previous signals
-                await check_results(
-                    app,
-                    candles,
-                    symbol
-                )
-
-                completed = candles[:-1]
-                entry = candles[-1]
-
-                signal = analyze(completed)
-
-                if not signal:
-                    continue
-
-                signal_key = (
-                    symbol,
-                    completed[-1]["dt"]
-                )
-
-                if LAST_SIGNAL.get(symbol) == signal_key:
-                    continue
-
-                if SENT_PER_MINUTE[minute_key] >= MAX_SIGNALS_PER_MINUTE:
-                    continue
-
-                LAST_SIGNAL[symbol] = signal_key
-
-                PENDING.append({
-                    "symbol": symbol,
-                    "direction": signal["direction"],
-                    "entry_price": entry["open"],
-                    "entry_dt": entry["dt"]
-                })
-
-                SENT_PER_MINUTE[minute_key] += 1
-
-                await send_signal(
-                    app,
-                    symbol,
-                    signal,
-                    entry
-                )
-
-            except Exception as error:
-
-                print(
-                    "Scanner error:",
-                    symbol,
-                    error
-                )
-
-
-# =========================
-# STARTUP
-# =========================
+# =====================================
+# APPLICATION LIFECYCLE
+# =====================================
 
 async def post_init(app):
 
-    print("DADAVAI V5 STARTED")
+    global SCANNER_TASK
 
-    app.create_task(
+    print("DADAVAI V5.1 STARTED")
+
+    SCANNER_TASK = asyncio.create_task(
         automatic_scan(app)
     )
 
+
+async def post_shutdown(app):
+
+    global SCANNER_TASK
+
+    if SCANNER_TASK is not None:
+
+        SCANNER_TASK.cancel()
+
+        try:
+            await SCANNER_TASK
+
+        except asyncio.CancelledError:
+            pass
+
+    print("DADAVAI V5.1 STOPPED")
+
+
+# =====================================
+# MAIN
+# =====================================
 
 def main():
 
@@ -608,6 +856,7 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
@@ -627,7 +876,7 @@ def main():
         CommandHandler("help", help_command)
     )
 
-    print("DADAVAI V5 BOT READY")
+    print("DADAVAI V5.1 BOT READY")
 
     app.run_polling()
 
