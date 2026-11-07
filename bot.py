@@ -3,6 +3,7 @@ import json
 import asyncio
 import urllib.parse
 import urllib.request
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -17,51 +18,73 @@ PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY"]
 CHATS = set()
 LAST_SIGNAL = {}
 
-def get_market_data(symbol):
+
+def fetch_market_data(symbol):
     params = urllib.parse.urlencode({
         "symbol": symbol,
         "interval": "1min",
-        "outputsize": 70,
-        "apikey": API_KEY,
-        "timezone": "UTC"
+        "outputsize": 100,
+        "apikey": API_KEY
     })
 
-    url = "https://api.twelvedata.com/time_series?" + params
-    request = urllib.request.Request(
-        url, headers={"User-Agent": "DADAVAI-BOT/1.0"}
+    url = (
+        "https://api.twelvedata.com/time_series?"
+        + params
     )
 
-    with urllib.request.urlopen(request, timeout=20) as response:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "DadavaiBot/1.0"}
+    )
+
+    with urllib.request.urlopen(
+        request, timeout=20
+    ) as response:
         data = json.loads(response.read().decode())
 
-    if data.get("status") != "ok" or "values" not in data:
-        raise ValueError(data.get("message", "Market data unavailable"))
+    if "values" not in data:
+        raise ValueError(
+            data.get("message", "Market data unavailable")
+        )
 
-    candles = data["values"]
+    # Twelve Data returns newest candle first.
+    rows = list(reversed(data["values"]))
 
-    if len(candles) < 60:
-        raise ValueError("Not enough candles")
+    # Ignore the newest candle because it may be incomplete.
+    rows = rows[:-1]
 
-    # Newest candle may still be forming
-    return list(reversed(candles))[1:]
+    if len(rows) < 60:
+        raise ValueError("Not enough candle data")
+
+    closes = [float(row["close"]) for row in rows]
+
+    return rows[-1]["datetime"], closes
+
 
 def ema(values, period):
+    if len(values) < period:
+        raise ValueError("Not enough EMA data")
+
     multiplier = 2 / (period + 1)
-    result = values[0]
+    result = [values[0]]
 
     for value in values[1:]:
-        result = value * multiplier + result * (1 - multiplier)
+        result.append(
+            (value * multiplier)
+            + (result[-1] * (1 - multiplier))
+        )
 
     return result
 
-def rsi(values, period=14):
+
+def calculate_rsi(values, period=14):
     changes = [
         values[i] - values[i - 1]
-        for i in range(1, len(values))
+        for i in range(len(values) - period, len(values))
     ]
 
-    gains = [max(x, 0) for x in changes[-period:]]
-    losses = [max(-x, 0) for x in changes[-period:]]
+    gains = [max(change, 0) for change in changes]
+    losses = [max(-change, 0) for change in changes]
 
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
@@ -69,114 +92,166 @@ def rsi(values, period=14):
     if avg_loss == 0:
         return 100 if avg_gain > 0 else 50
 
-    return 100 - (100 / (1 + avg_gain / avg_loss))
+    rs = avg_gain / avg_loss
 
-def analyze(symbol):
-    candles = get_market_data(symbol)
-    closes = [float(c["close"]) for c in candles]
+    return 100 - (100 / (1 + rs))
 
-    fast = ema(closes[-50:], 9)
-    slow = ema(closes[-50:], 21)
-    momentum = rsi(closes)
 
-    macd_now = (
-        ema(closes[-50:], 12) -
-        ema(closes[-50:], 26)
+def analyze_market(closes):
+    ema9 = ema(closes, 9)[-1]
+    ema21 = ema(closes, 21)[-1]
+
+    rsi = calculate_rsi(closes)
+
+    macd_line = [
+        fast - slow
+        for fast, slow in zip(
+            ema(closes, 12),
+            ema(closes, 26)
+        )
+    ]
+
+    macd_signal = ema(macd_line, 9)[-1]
+    macd = macd_line[-1]
+
+    if (
+        ema9 > ema21
+        and macd > macd_signal
+        and 50 < rsi < 70
+    ):
+        return "BUY", rsi
+
+    if (
+        ema9 < ema21
+        and macd < macd_signal
+        and 30 < rsi < 50
+    ):
+        return "SELL", rsi
+
+    return "WAIT", rsi
+
+
+async def get_signal(symbol):
+    candle_time, closes = await asyncio.to_thread(
+        fetch_market_data, symbol
     )
 
-    macd_prev = (
-        ema(closes[-51:-1], 12) -
-        ema(closes[-51:-1], 26)
-    )
+    direction, rsi = analyze_market(closes)
 
-    if fast > slow and momentum > 50 and macd_now > macd_prev and macd_now > 0:
-        direction = "CALL 🟢"
-    elif fast < slow and momentum < 50 and macd_now < macd_prev and macd_now < 0:
-        direction = "PUT 🔴"
-    else:
-        direction = "NO TRADE ⚪"
+    return candle_time, direction, rsi
+
+
+def signal_message(symbol, candle_time, direction, rsi):
+    emoji = {
+        "BUY": "🟢",
+        "SELL": "🔴",
+        "WAIT": "⚪"
+    }.get(direction, "⚪")
 
     return (
-        f"📊 {symbol}\n"
-        f"⏱ Timeframe: M1\n"
-        f"📈 EMA 9: {fast:.5f}\n"
-        f"📉 EMA 21: {slow:.5f}\n"
-        f"RSI: {momentum:.2f}\n"
-        f"MACD: {macd_now:.6f}\n\n"
-        f"Signal: {direction}\n"
-        f"⚠️ Demo analysis only"
+        "🤖 DADAVAI 24H BOT\n\n"
+        f"💱 Pair: {symbol}\n"
+        "⏱ Timeframe: M1\n"
+        f"📊 Signal: {emoji} {direction}\n"
+        f"📈 RSI: {rsi:.2f}\n"
+        f"🕒 Candle: {candle_time}\n\n"
+        "⚠️ Signals are not guaranteed. "
+        "Verify before trading."
     )
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    CHATS.add(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    CHATS.add(chat_id)
 
     await update.message.reply_text(
-        "🤖 DADAVAI 24H BOT\n"
-        "Automatic M1 Analysis Started!\n\n"
-        "/signal - Analyze Forex pairs\n"
+        "🤖 DADAVAI 24H BOT\n\n"
+        "Welcome!\n"
+        "Forex M1 Signal Engine is active.\n\n"
+        "/signal - Check market signals\n"
         "/help - Help"
     )
 
-async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not API_KEY:
-        await update.message.reply_text("API key missing.")
-        return
 
-    await update.message.reply_text("🔎 Fetching market data...")
+async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📊 Checking live Forex market data..."
+    )
 
     for symbol in PAIRS:
         try:
-            result = await asyncio.to_thread(analyze, symbol)
-            await update.message.reply_text(result)
+            candle_time, direction, rsi = await get_signal(symbol)
+
+            message = signal_message(
+                symbol, candle_time, direction, rsi
+            )
+
+            await update.message.reply_text(message)
+
         except Exception as error:
             await update.message.reply_text(
                 f"⚠️ {symbol}: Data unavailable.\n"
-                f"{str(error)[:150]}"
+                f"Reason: {str(error)[:180]}"
             )
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "DADAVAI 24H BOT\n"
+        "🤖 DADAVAI 24H BOT HELP\n\n"
         "/start - Start bot\n"
-        "/signal - M1 market analysis\n"
-        "Forex demo analysis only."
+        "/signal - Get M1 Forex signals\n"
+        "/help - Help\n\n"
+        "Pairs:\n"
+        "EUR/USD\n"
+        "GBP/USD\n"
+        "USD/JPY"
     )
+
 
 async def automatic_scan(app):
     while True:
-        await asyncio.sleep(60)
-
         for symbol in PAIRS:
             try:
-                result = await asyncio.to_thread(analyze, symbol)
+                candle_time, direction, rsi = await get_signal(symbol)
 
-                if "CALL 🟢" not in result and "PUT 🔴" not in result:
+                if direction == "WAIT":
                     continue
 
-                key = (symbol, result.split("Signal: ")[1].split("\n")[0])
-
-                if LAST_SIGNAL.get(symbol) == key[1]:
+                # Send only once for each completed candle.
+                if LAST_SIGNAL.get(symbol) == candle_time:
                     continue
 
-                LAST_SIGNAL[symbol] = key[1]
+                LAST_SIGNAL[symbol] = candle_time
+
+                message = signal_message(
+                    symbol, candle_time, direction, rsi
+                )
 
                 for chat_id in list(CHATS):
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text="🤖 DADAVAI 24H BOT\n" + result
-                    )
+                    try:
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=message
+                        )
+                    except Exception as error:
+                        print("Telegram send error:", error)
 
-            except Exception:
-                continue
+            except Exception as error:
+                print(f"{symbol} scan error: {error}")
+
+        await asyncio.sleep(60)
+
 
 async def post_init(app):
     app.create_task(automatic_scan(app))
 
+
 def main():
     if not TOKEN:
-        raise ValueError("BOT_TOKEN missing")
+        raise RuntimeError("BOT_TOKEN is missing")
+
     if not API_KEY:
-        raise ValueError("TWELVE_DATA_KEY missing")
+        raise RuntimeError("TWELVE_DATA_KEY is missing")
 
     app = (
         Application.builder()
@@ -189,7 +264,10 @@ def main():
     app.add_handler(CommandHandler("signal", signal))
     app.add_handler(CommandHandler("help", help_command))
 
+    print("DADAVAI 24H BOT started!")
+
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
