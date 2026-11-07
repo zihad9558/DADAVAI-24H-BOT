@@ -247,6 +247,7 @@ async def post_init(app):
 
 
 def main():
+    print("DADAVAI NEW BOT VERSION 2 STARTED", flush=True)
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is missing")
 
