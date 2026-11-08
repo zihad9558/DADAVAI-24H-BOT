@@ -23,7 +23,7 @@ jobs:
       - name: Verify V5 Code
         run: |
           echo "CHECKING BOT VERSION"
-          grep -n "DADAVAI V5 BOT READY" bot.py
+          grep -n "DADAVAI V5.1 BOT READY" bot.py
           python -m py_compile bot.py
 
       - name: Start Telegram Bot
